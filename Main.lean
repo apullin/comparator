@@ -24,6 +24,7 @@ structure Context where
   challengeFromExport? : Option System.FilePath
   saveChallengeExport? : Option System.FilePath
   solutionFromExport? : Option System.FilePath
+  jobs : Nat
 
 abbrev M := ReaderT Context IO
 
@@ -159,12 +160,13 @@ def runExternalKernel (kernelName : String) (kernelCommand : Array String)
   IO.FS.withTempFile fun configHandle configPath => do
   IO.FS.withTempFile fun solutionHandle solutionPath => do
     let legalAxioms ← getLegalAxioms
+    let numThreads := max 1 (← read).jobs
     configHandle.putStr <| Lean.Json.compress <| Lean.Json.mkObj [
       ("use_stdin", false),
       ("export_file_path", solutionPath.toString),
       ("permitted_axioms", .arr <| legalAxioms.map (.str ∘ Lean.Name.toString)),
       ("unpermitted_axiom_hard_error", true),
-      ("num_threads", 4),
+      ("num_threads", numThreads),
       ("nat_extension", true),
       ("string_extension", true),
     ]
@@ -290,45 +292,69 @@ def stringStream (s : String) : BaseIO IO.FS.Stream := do
 
 def verifyMatch (challengeExport : String) (solutionExport : String) :
     M Unit := do
-  let challenge ← Export.parseStream (← stringStream challengeExport)
-  let solution ← Export.parseStream (← stringStream solutionExport)
+  -- Parse challenge & solution exports concurrently across IO worker threads
+  let chalTask ← IO.asTask (prio := .dedicated) do
+    Export.parseStream (← stringStream challengeExport)
+  let solTask ← IO.asTask (prio := .dedicated) do
+    Export.parseStream (← stringStream solutionExport)
+  let challenge ← IO.ofExcept chalTask.get
+  let solution ← IO.ofExcept solTask.get
   let theoremNames ← getTheoremNames
   let definitionNames ← getDefinitionNames
   let targets := (← getTheoremNames) ++ (← getLegalAxioms)
   IO.ofExcept <| Comparator.compareAt challenge solution targets definitionNames (← primitiveTargets)
   IO.ofExcept <| Comparator.checkAxioms solution theoremNames definitionNames (← getLegalAxioms)
-  let mut result := none
-  for (kernelName, kernelCommand) in ← getExternalKernels do
-    result := result <|> (← runExternalKernel kernelName kernelCommand solutionExport)
-  result := result <|> (← runBuiltinKernel solution)
+
+  -- Run external kernels (e.g. nanoda) and Lean's built-in kernel concurrently!
+  let ctx ← read
+  let extKernels := (← getExternalKernels).toArray
+  let extTasks ← extKernels.mapM fun (kernelName, kernelCommand) =>
+    IO.asTask (prio := .dedicated) (ReaderT.run (runExternalKernel kernelName kernelCommand solutionExport) ctx)
+  let builtinTask ← IO.asTask (prio := .dedicated) (ReaderT.run (runBuiltinKernel solution) ctx)
+
+  let mut result : Option String := none
+  for t in extTasks do
+    result := result <|> (← IO.ofExcept t.get)
+  result := result <|> (← IO.ofExcept builtinTask.get)
   if let some error := result then
     throw <| IO.userError error
+
+def loadOrBuildChallenge (exportTargets : Array Lean.Name) : M String := do
+  if let some exportPath := (← read).challengeFromExport? then
+    IO.println s!"Loading precomputed challenge export from {exportPath}"
+    IO.FS.readFile exportPath
+  else
+    let challengeModule ← getChallengeModule
+    safeLakeBuild challengeModule
+    let exp ← safeExport challengeModule exportTargets
+    if let some savePath := (← read).saveChallengeExport? then
+      IO.println s!"Saving challenge export to {savePath}"
+      IO.FS.writeFile savePath exp
+    pure exp
+
+def loadOrBuildSolution (exportTargets : Array Lean.Name) : M String := do
+  if let some solPath := (← read).solutionFromExport? then
+    IO.println s!"Loading precomputed solution export from {solPath}"
+    IO.FS.readFile solPath
+  else
+    let solutionModule ← getSolutionModule
+    safeLakeBuild solutionModule
+    safeExport solutionModule exportTargets
 
 def compareIt : M Unit := do
   let exportTargets := (← builtinTargets) ++ (← getTheoremNames) ++ (← getLegalAxioms)
     ++ (← primitiveTargets) ++ (← getDefinitionNames)
-
-  let challengeExport ←
-    if let some exportPath := (← read).challengeFromExport? then
-      IO.println s!"Loading precomputed challenge export from {exportPath}"
-      IO.FS.readFile exportPath
+  let ctx ← read
+  -- Overlap Challenge load/export and Solution build/export when jobs > 1
+  let (challengeExport, solutionExport) ←
+    if ctx.jobs > 1 && (ctx.challengeFromExport?.isSome || ctx.solutionFromExport?.isSome) then
+      let cTask ← IO.asTask (prio := .dedicated) (ReaderT.run (loadOrBuildChallenge exportTargets) ctx)
+      let sTask ← IO.asTask (prio := .dedicated) (ReaderT.run (loadOrBuildSolution exportTargets) ctx)
+      pure (← IO.ofExcept cTask.get, ← IO.ofExcept sTask.get)
     else
-      let challengeModule ← getChallengeModule
-      safeLakeBuild challengeModule
-      let exp ← safeExport challengeModule exportTargets
-      if let some savePath := (← read).saveChallengeExport? then
-        IO.println s!"Saving challenge export to {savePath}"
-        IO.FS.writeFile savePath exp
-      pure exp
-
-  let solutionExport ←
-    if let some solPath := (← read).solutionFromExport? then
-      IO.println s!"Loading precomputed solution export from {solPath}"
-      IO.FS.readFile solPath
-    else
-      let solutionModule ← getSolutionModule
-      safeLakeBuild solutionModule
-      safeExport solutionModule exportTargets
+      let c ← loadOrBuildChallenge exportTargets
+      let s ← loadOrBuildSolution exportTargets
+      pure (c, s)
 
   verifyMatch challengeExport solutionExport
 
@@ -339,31 +365,36 @@ structure CliOpts where
   challengeFromExport? : Option System.FilePath := none
   saveChallengeExport? : Option System.FilePath := none
   solutionFromExport? : Option System.FilePath := none
+  jobs? : Option Nat := none
 
 partial def parseCliArgs (args : List String) : IO CliOpts := do
   let rec go (rest : List String) (cfg? : Option String)
-      (cf? sf? solf? : Option System.FilePath) : IO CliOpts := do
+      (cf? sf? solf? : Option System.FilePath) (jobs? : Option Nat) : IO CliOpts := do
     match rest with
     | [] =>
       let some cfg := cfg?
-        | throw <| .userError "Usage: comparator <config.json> [--challenge-from-export <path>] [--save-challenge-export <path>] [--solution-from-export <path>]"
+        | throw <| .userError "Usage: comparator <config.json> [--challenge-from-export <path>] [--save-challenge-export <path>] [--solution-from-export <path>] [--jobs <N>]"
       return {
         configPath := cfg
         challengeFromExport? := cf?
         saveChallengeExport? := sf?
         solutionFromExport? := solf?
+        jobs? := jobs?
       }
-    | "--challenge-from-export" :: p :: tail => go tail cfg? (some p) sf? solf?
-    | "--save-challenge-export" :: p :: tail => go tail cfg? cf? (some p) solf?
-    | "--solution-from-export" :: p :: tail => go tail cfg? cf? sf? (some p)
+    | "--challenge-from-export" :: p :: tail => go tail cfg? (some p) sf? solf? jobs?
+    | "--save-challenge-export" :: p :: tail => go tail cfg? cf? (some p) solf? jobs?
+    | "--solution-from-export" :: p :: tail => go tail cfg? cf? sf? (some p) jobs?
+    | "--jobs" :: n :: tail =>
+      let some k := n.toNat? | throw <| .userError s!"Invalid --jobs count: {n}"
+      go tail cfg? cf? sf? solf? (some k)
     | flag :: _ =>
       if flag.startsWith "--" then
         throw <| .userError s!"Unknown flag: {flag}"
       else if cfg?.isSome then
         throw <| .userError s!"Unexpected positional argument: {flag}"
       else
-        go rest.tail! (some flag) cf? sf? solf?
-  go args none none none none
+        go rest.tail! (some flag) cf? sf? solf? jobs?
+  go args none none none none none
 
 structure Config where
   challenge_module : String
@@ -390,6 +421,9 @@ def M.run (x : M α) (cfg : Config) (cli : CliOpts) : IO α := do
   let solutionFromExport? ← match cli.solutionFromExport? with
     | some p => pure (some p)
     | none => pure ((← IO.getEnv "COMPARATOR_SOLUTION_EXPORT").map System.FilePath.mk)
+  let jobs ← match cli.jobs? with
+    | some k => pure (max 1 k)
+    | none => pure (((← IO.getEnv "COMPARATOR_JOBS").bind String.toNat?).getD 4)
   let mut externalKernels := cfg.external_kernels?.getD {}
   let defaultNanoda := "nanoda_bin"
   let nanodaOverride? ← IO.getEnv "COMPARATOR_NANODA"
@@ -421,7 +455,8 @@ def M.run (x : M α) (cfg : Config) (cli : CliOpts) : IO α := do
     externalKernels := externalKernels,
     challengeFromExport? := challengeFromExport?,
     saveChallengeExport? := saveChallengeExport?,
-    solutionFromExport? := solutionFromExport?
+    solutionFromExport? := solutionFromExport?,
+    jobs := jobs
   }
 
 end Comparator
