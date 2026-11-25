@@ -21,6 +21,9 @@ structure Context where
   whichLandrun : String
   whichLean4Export : String
   externalKernels : (Std.TreeMap String (Array String))
+  challengeFromExport? : Option System.FilePath
+  saveChallengeExport? : Option System.FilePath
+  solutionFromExport? : Option System.FilePath
 
 abbrev M := ReaderT Context IO
 
@@ -305,17 +308,62 @@ def compareIt : M Unit := do
   let exportTargets := (← builtinTargets) ++ (← getTheoremNames) ++ (← getLegalAxioms)
     ++ (← primitiveTargets) ++ (← getDefinitionNames)
 
-  let challengeModule ← getChallengeModule
-  safeLakeBuild challengeModule
-  let challengeExport ← safeExport challengeModule exportTargets
+  let challengeExport ←
+    if let some exportPath := (← read).challengeFromExport? then
+      IO.println s!"Loading precomputed challenge export from {exportPath}"
+      IO.FS.readFile exportPath
+    else
+      let challengeModule ← getChallengeModule
+      safeLakeBuild challengeModule
+      let exp ← safeExport challengeModule exportTargets
+      if let some savePath := (← read).saveChallengeExport? then
+        IO.println s!"Saving challenge export to {savePath}"
+        IO.FS.writeFile savePath exp
+      pure exp
 
-  let solutionModule ← getSolutionModule
-  safeLakeBuild solutionModule
-  let solutionExport ← safeExport solutionModule exportTargets
+  let solutionExport ←
+    if let some solPath := (← read).solutionFromExport? then
+      IO.println s!"Loading precomputed solution export from {solPath}"
+      IO.FS.readFile solPath
+    else
+      let solutionModule ← getSolutionModule
+      safeLakeBuild solutionModule
+      safeExport solutionModule exportTargets
 
   verifyMatch challengeExport solutionExport
 
   IO.println "Your solution is okay!"
+
+structure CliOpts where
+  configPath : String
+  challengeFromExport? : Option System.FilePath := none
+  saveChallengeExport? : Option System.FilePath := none
+  solutionFromExport? : Option System.FilePath := none
+
+partial def parseCliArgs (args : List String) : IO CliOpts := do
+  let rec go (rest : List String) (cfg? : Option String)
+      (cf? sf? solf? : Option System.FilePath) : IO CliOpts := do
+    match rest with
+    | [] =>
+      let some cfg := cfg?
+        | throw <| .userError "Usage: comparator <config.json> [--challenge-from-export <path>] [--save-challenge-export <path>] [--solution-from-export <path>]"
+      return {
+        configPath := cfg
+        challengeFromExport? := cf?
+        saveChallengeExport? := sf?
+        solutionFromExport? := solf?
+      }
+    | "--challenge-from-export" :: p :: tail => go tail cfg? (some p) sf? solf?
+    | "--save-challenge-export" :: p :: tail => go tail cfg? cf? (some p) solf?
+    | "--solution-from-export" :: p :: tail => go tail cfg? cf? sf? (some p)
+    | flag :: _ =>
+      if flag.startsWith "--" then
+        throw <| .userError s!"Unknown flag: {flag}"
+      else if cfg?.isSome then
+        throw <| .userError s!"Unexpected positional argument: {flag}"
+      else
+        go rest.tail! (some flag) cf? sf? solf?
+  go args none none none none
 
 structure Config where
   challenge_module : String
@@ -327,12 +375,21 @@ structure Config where
   external_kernels? : Option (Std.TreeMap String (Array String))
   deriving Lean.FromJson, Lean.ToJson, Repr
 
-def M.run (x : M α) (cfg : Config) : IO α := do
+def M.run (x : M α) (cfg : Config) (cli : CliOpts) : IO α := do
   let cwd ← IO.Process.getCurrentDir
   let leanPrefix ← queryLeanPrefix cwd
   let gitLocation ← queryGitLocation
   let whichLean4Export := (← IO.getEnv "COMPARATOR_LEAN4EXPORT").getD "lean4export"
   let whichLandrun := (← IO.getEnv "COMPARATOR_LANDRUN").getD "landrun"
+  let challengeFromExport? ← match cli.challengeFromExport? with
+    | some p => pure (some p)
+    | none => pure ((← IO.getEnv "COMPARATOR_CHALLENGE_EXPORT").map System.FilePath.mk)
+  let saveChallengeExport? ← match cli.saveChallengeExport? with
+    | some p => pure (some p)
+    | none => pure ((← IO.getEnv "COMPARATOR_SAVE_CHALLENGE_EXPORT").map System.FilePath.mk)
+  let solutionFromExport? ← match cli.solutionFromExport? with
+    | some p => pure (some p)
+    | none => pure ((← IO.getEnv "COMPARATOR_SOLUTION_EXPORT").map System.FilePath.mk)
   let mut externalKernels := cfg.external_kernels?.getD {}
   let defaultNanoda := "nanoda_bin"
   let nanodaOverride? ← IO.getEnv "COMPARATOR_NANODA"
@@ -361,14 +418,16 @@ def M.run (x : M α) (cfg : Config) : IO α := do
     gitLocation := gitLocation,
     whichLean4Export := whichLean4Export,
     whichLandrun := whichLandrun,
-    externalKernels := externalKernels
+    externalKernels := externalKernels,
+    challengeFromExport? := challengeFromExport?,
+    saveChallengeExport? := saveChallengeExport?,
+    solutionFromExport? := solutionFromExport?
   }
 
 end Comparator
 
 def main (args : List String) : IO Unit := do
-  let some (configPath : String) := args[0]?
-    | throw <| .userError "Expected config file path as first argument."
-  let content ← IO.FS.readFile configPath
+  let cli ← Comparator.parseCliArgs args
+  let content ← IO.FS.readFile cli.configPath
   let config ← IO.ofExcept <| Lean.FromJson.fromJson? <| ← IO.ofExcept <| Lean.Json.parse content
-  Comparator.M.run Comparator.compareIt config
+  Comparator.M.run Comparator.compareIt config cli
