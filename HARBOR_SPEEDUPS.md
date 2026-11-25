@@ -43,3 +43,15 @@ try:
 except OSError:
     os.symlink(cas_blob, dst)  # if `/data` and workspace are on different mounts
 ```
+
+---
+
+## 4. Multi-Core Overlap (`parallel` branch on top of `feat/harbor-1cpu-speedups`)
+
+If containers have `>= 2` vCPUs available:
+1. **Concurrent `Export.parseStream` + concurrent `nanoda` & built-in Lean kernel replay (`Main.lean`):**
+   - Overlaps `nanoda` (`num_threads = --jobs <N>`) with Lean's built-in `kernelEnv.replay` via `IO.asTask (prio := .dedicated)` instead of running both kernels back-to-back (~`1.7–1.9x` faster kernel phase).
+   - Overlaps `Challenge` export loading/parsing with `Solution` build/export.
+2. **Parallel `hydrate_cas` (`ThreadPoolExecutor(max_workers=16)`):** Cuts 30k–60k inode creation from `~30s -> ~2s`.
+3. **Multi-root parallel `lean4export` (`scripts/parallel_export.py` + `--solution-from-export`):** Cuts multi-bundle export wall time `~2.9x`.
+
